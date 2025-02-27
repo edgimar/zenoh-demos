@@ -11,7 +11,6 @@
 // Contributors:
 //   The Zenoh Team, <zenoh@zettascale.tech>
 //
-use async_std::channel::bounded;
 use cdr::{CdrLe, Infinite};
 use clap::{App, Arg};
 use crossterm::{
@@ -19,14 +18,13 @@ use crossterm::{
     event::{Event, KeyCode, KeyEvent, KeyModifiers},
     ExecutableCommand,
 };
-use futures::prelude::*;
-use futures::select;
+//use futures::prelude::*;
+use futures::{select, FutureExt};
 use serde_derive::{Deserialize, Serialize};
 use std::fmt;
 use std::io::{stdout, Write};
-use zenoh::buffers::reader::HasReader;
-use zenoh::config::Config;
-use zenoh::{prelude::r#async::AsyncResolve, publication::Publisher};
+use tokio::sync::mpsc;
+use zenoh::{config::Config, pubsub::Publisher};
 
 #[derive(Serialize, PartialEq, Debug)]
 struct Vector3 {
@@ -68,7 +66,7 @@ impl fmt::Display for Log {
     }
 }
 
-async fn pub_twist(publisher: &Publisher<'_>, linear: f64, angular: f64) {
+async fn pub_twist<'a>(publisher: &'a Publisher<'_>, linear: f64, angular: f64) {
     let twist = Twist {
         linear: Vector3 {
             x: linear,
@@ -85,24 +83,24 @@ async fn pub_twist(publisher: &Publisher<'_>, linear: f64, angular: f64) {
     write!(
         stdout(),
         "Publish on {} : {:?}\r\n",
-        publisher.key_expr().as_str(),
+        publisher.key_expr(),
         twist
     )
     .unwrap_or_default();
     let encoded = cdr::serialize::<_, _, CdrLe>(&twist, Infinite).unwrap();
-    if let Err(e) = publisher.put(encoded).res().await {
-        log::warn!("Error writing {}: {}", publisher.key_expr().as_str(), e);
+    if let Err(e) = publisher.put(encoded).await {
+        log::warn!("Error writing {}: {}", publisher.key_expr(), e);
     }
 }
 
-async fn del_twist(publisher: &Publisher<'_>) {
-    write!(stdout(), "Delete on {}\r\n", publisher.key_expr().as_str()).unwrap_or_default();
-    if let Err(e) = publisher.delete().res().await {
-        log::warn!("Error deleting {}: {}", publisher.key_expr().as_str(), e);
+async fn del_twist<'a>(publisher: &'a Publisher<'_>) {
+    write!(stdout(), "Delete on {}\r\n", publisher.key_expr()).unwrap_or_default();
+    if let Err(e) = publisher.delete().await {
+        log::warn!("Error deleting {}: {}", publisher.key_expr(), e);
     }
 }
 
-#[async_std::main]
+#[tokio::main]
 async fn main() {
     // Initiate logging
     env_logger::init();
@@ -110,21 +108,22 @@ async fn main() {
     let (config, cmd_vel, rosout, linear_scale, angular_scale) = parse_args();
 
     println!("Opening session...");
-    let session = zenoh::open(config).res().await.unwrap();
+    let session = zenoh::open(config).await.unwrap();
 
     println!("Subscriber on {}", rosout);
-    let subscriber = session.declare_subscriber(rosout).res().await.unwrap();
+    let subscriber = session.declare_subscriber(rosout).await.unwrap();
 
-    // Declare the Key Expression corresponding to "cmd_vel" topic for wire efficiency at publications
-    let publisher = session.declare_publisher(cmd_vel).res().await.unwrap();
+    let publisher = session.declare_publisher(cmd_vel).await.unwrap();
 
     // Keyboard event read loop, sending each to an async_std channel
     // Note: enable raw mode for direct processing of key pressed, without having to hit ENTER...
     // Unfortunately, this mode doesn't process new line characters on println!().
     // Thus write!(stdout(), "...\r\n") has to be used instead.
     crossterm::terminal::enable_raw_mode().unwrap();
-    let (key_sender, key_receiver) = bounded::<Event>(10);
-    async_std::task::spawn(async move {
+    let (key_sender, mut key_receiver) = mpsc::channel::<Event>(10);
+    let key_sender = key_sender.clone();
+
+    tokio::spawn(async move {
         loop {
             match crossterm::event::read() {
                 Ok(ev) => {
@@ -149,57 +148,56 @@ async fn main() {
     loop {
         select!(
             // On sample received by the subsriber
-            sample = subscriber.recv_async().fuse() => {
-                let sample = sample.unwrap();
-                // copy to be removed if possible
-                // let buf = sample.payload.to_vec();
-                match cdr::deserialize_from::<_, Log, _>(sample.value.payload.reader(), cdr::size::Infinite) {
-                    Ok(log) => {
-                        println!("{}", log);
-                        std::io::stdout().execute(MoveToColumn(0)).unwrap();
+            sample = subscriber.recv_async() => {
+                if let Ok(sample) = sample {
+                    match cdr::deserialize_from::<_, Log, _>(std::io::Cursor::new(sample.payload().to_bytes()), cdr::size::Infinite) {
+                        Ok(log) => {
+                            println!("{}", log);
+                            std::io::stdout().execute(MoveToColumn(0)).unwrap();
+                        }
+                        Err(e) => log::warn!("Error decoding Log: {}", e),
                     }
-                    Err(e) => log::warn!("Error decoding Log: {}", e),
                 }
             },
 
-            // On keyboard event received from the async_std channel
+            // On keyboard event received from the tokio channel
             event = key_receiver.recv().fuse() => {
                 match event {
-                    Ok(Event::Key(KeyEvent {
+                    Some(Event::Key(KeyEvent {
                         code: KeyCode::Up,
                         modifiers: _,
                     })) => pub_twist(&publisher, 1.0 * linear_scale, 0.0).await,
-                    Ok(Event::Key(KeyEvent {
+                    Some(Event::Key(KeyEvent {
                         code: KeyCode::Down,
                         modifiers: _,
                     })) => pub_twist(&publisher, -1.0 * linear_scale, 0.0).await,
-                    Ok(Event::Key(KeyEvent {
+                    Some(Event::Key(KeyEvent {
                         code: KeyCode::Left,
                         modifiers: _,
                     })) => pub_twist(&publisher, 0.0, 1.0 * angular_scale).await,
-                    Ok(Event::Key(KeyEvent {
+                    Some(Event::Key(KeyEvent {
                         code: KeyCode::Right,
                         modifiers: _,
                     })) => pub_twist(&publisher, 0.0, -1.0 * angular_scale).await,
-                    Ok(Event::Key(KeyEvent {
+                    Some(Event::Key(KeyEvent {
                         code: KeyCode::Char(' '),
                         modifiers: _,
                     })) => pub_twist(&publisher, 0.0, 0.0).await,
-                    Ok(Event::Key(KeyEvent {
+                    Some(Event::Key(KeyEvent {
                         code: KeyCode::Esc,
                         modifiers: _,
                     }))
-                    | Ok(Event::Key(KeyEvent {
+                    | Some(Event::Key(KeyEvent {
                         code: KeyCode::Char('q'),
                         modifiers: _,
                     })) => break,
-                    Ok(Event::Key(KeyEvent {
+                    Some(Event::Key(KeyEvent {
                         code: KeyCode::Char('d'),
                         modifiers: _
                     })) => {
                         del_twist(&publisher).await
                     },
-                    Ok(Event::Key(KeyEvent {
+                    Some(Event::Key(KeyEvent {
                         code: KeyCode::Char('c'),
                         modifiers,
                     })) => {
@@ -207,9 +205,10 @@ async fn main() {
                             break;
                         }
                     }
-                    Ok(_) => (),
-                    Err(e) => {
-                        log::warn!("Input error: {}", e);
+                    Some(_) => (),
+                    None => {
+                        log::warn!("Channel closed");
+                        break;
                     }
                 }
             }
@@ -219,12 +218,13 @@ async fn main() {
     // Stop robot at exit
     pub_twist(&publisher, 0.0, 0.0).await;
 
-    subscriber.undeclare().res().await.unwrap();
-    publisher.undeclare().res().await.unwrap();
-    // session.undeclare(cmd_key).res().await.unwrap();
-    session.close().res().await.unwrap();
+    subscriber.undeclare().await.unwrap();
+    publisher.undeclare().await.unwrap();
+    session.close().await.unwrap();
 
     crossterm::terminal::disable_raw_mode().unwrap();
+
+    std::process::exit(0);
 }
 
 fn parse_args() -> (Config, String, String, f64, f64) {
@@ -234,10 +234,10 @@ fn parse_args() -> (Config, String, String, f64, f64) {
                 .possible_values(["peer", "client"]),
         )
         .arg(Arg::from_usage(
-            "-e, --connect=[LOCATOR]...   'Endpoints to connect to.'",
+            "-e, --connect=[ENDPOINT]...   'Endpoints to connect to.'",
         ))
         .arg(Arg::from_usage(
-            "-l, --listen=[LOCATOR]...   'Endpoints to listen on.'",
+            "-l, --listen=[ENDPOINT]...   'Endpoints to listen on.'",
         ))
         .arg(Arg::from_usage(
             "-c, --config=[FILE]      'A configuration file.'",
@@ -255,9 +255,6 @@ fn parse_args() -> (Config, String, String, f64, f64) {
                 .default_value("2.0"),
         )
         .arg(Arg::from_usage("-x, --linear_scale=[FLOAT] 'The linear scale.").default_value("2.0"))
-        .arg(Arg::from_usage(
-            "--no-multicast-scouting 'Disable the multicast-based scouting mechanism.'",
-        ))
         .get_matches();
 
     let mut config = if let Some(conf_file) = args.value_of("config") {
@@ -265,23 +262,34 @@ fn parse_args() -> (Config, String, String, f64, f64) {
     } else {
         Config::default()
     };
-    if let Some(Ok(mode)) = args.value_of("mode").map(|mode| mode.parse()) {
-        config.set_mode(Some(mode)).unwrap();
-    }
-    if let Some(values) = args.values_of("connect") {
+
+    if let Some(endpoints) = args.values_of("connect") {
         config
             .connect
             .endpoints
-            .extend(values.map(|v| v.parse().unwrap()))
+            .set(
+                endpoints
+                    .collect::<Vec<&str>>()
+                    .as_slice()
+                    .iter()
+                    .map(|e| e.parse().unwrap())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
     }
-    if let Some(values) = args.values_of("listen") {
+    if let Some(endpoints) = args.values_of("listen") {
         config
             .listen
             .endpoints
-            .extend(values.map(|v| v.parse().unwrap()))
-    }
-    if args.is_present("no-multicast-scouting") {
-        config.scouting.multicast.set_enabled(Some(false)).unwrap();
+            .set(
+                endpoints
+                    .collect::<Vec<&str>>()
+                    .as_slice()
+                    .iter()
+                    .map(|e| e.parse().unwrap())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
     }
 
     let cmd_vel = args.value_of("cmd_vel").unwrap().to_string();
